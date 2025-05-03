@@ -1,0 +1,9 @@
+# Requirements for Akita Advanced Location/Navigation Plugin (AALNP) v2.1
+
+meshtastic>=2.0.0 # Specify a minimum version if known, otherwise just the package name
+haversine>=2.8.0
+shapely>=2.0.0
+geomet>=1.0.0 # Optional, but listed in README for GeoJSON handling (manual dicts used in code)
+
+# Note: Specific versions might be required depending on your Python version
+# and Meshtastic device firmware compatibility. Adjust as needed.
