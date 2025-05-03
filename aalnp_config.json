@@ -1,0 +1,49 @@
+{
+  "log_file": "location_log.geojson",
+  "base_interval_s": 300,
+  "fast_interval_s": 60,
+  "speed_threshold_mps": 2.0,
+  "enable_location_response": true,
+  "node_metadata": "AALNP Node",
+  "tx_delay_ms_override": null,
+  "waypoint": null,
+  "proximity_alert": {
+    "enabled": true,
+    "distance_m": 500,
+    "alert_interval_s": 60
+  },
+  "commands": {
+    "prefix": "/aalnp",
+    "allow_remote_config": false
+  },
+  "display": {
+    "enabled": true,
+    "update_interval_s": 10,
+    "mode": "auto"
+  },
+  "track_storage": {
+    "max_points_per_node": 10
+  },
+  "geofences": [
+    {
+      "name": "HomeZone",
+      "enabled": true,
+      "polygon": [
+        [42.8864, -79.2428],
+        [42.8864, -79.2300],
+        [42.8800, -79.2300],
+        [42.8800, -79.2428]
+      ]
+    },
+    {
+      "name": "Work",
+      "enabled": false,
+      "polygon": [
+        [42.9000, -79.2500],
+        [42.9000, -79.2450],
+        [42.8980, -79.2450],
+        [42.8980, -79.2500]
+      ]
+    }
+  ]
+}
