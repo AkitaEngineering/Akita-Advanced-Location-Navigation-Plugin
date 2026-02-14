@@ -26,7 +26,7 @@ try:
     # Try importing from the modern protobuf structure first
     from meshtastic.protobuf import portnums_pb2, mesh_pb2
     Ports = portnums_pb2.PortNum # Use the Enum directly
-    DATA_APP_PORT = Ports.DATA_APP # Use the enum value directly
+    DATA_APP_PORT = Ports.PRIVATE_APP # Use PRIVATE_APP for custom data payloads
     POSITION_APP_PORT = Ports.POSITION_APP # Use the enum value directly
     TEXT_MESSAGE_APP_PORT = Ports.TEXT_MESSAGE_APP
     Mesh = mesh_pb2 # For accessing enums like HopLimit
@@ -36,7 +36,7 @@ except ImportError:
         # Try older style if above fails (check exact paths for older versions)
         from meshtastic import portnums_pb2 as Ports # Alias
         from meshtastic import mesh_pb2
-        DATA_APP_PORT = Ports.DATA_APP
+        DATA_APP_PORT = Ports.PRIVATE_APP
         POSITION_APP_PORT = Ports.POSITION_APP
         TEXT_MESSAGE_APP_PORT = Ports.TEXT_MESSAGE_APP
         Mesh = mesh_pb2
@@ -44,9 +44,9 @@ except ImportError:
     except (ImportError, AttributeError):
         # Fallback if specific protobufs cannot be imported
         print("WARN: Could not import specific protobuf definitions. Using fallback integer values.")
-        DATA_APP_PORT = 256 # Common default for DATA_APP
-        POSITION_APP_PORT = 1 # Common default for POSITION_APP
-        TEXT_MESSAGE_APP_PORT = 4403 # Common default for text
+        DATA_APP_PORT = 256 # PRIVATE_APP default
+        POSITION_APP_PORT = 1 # POSITION_APP default
+        TEXT_MESSAGE_APP_PORT = 4403 # TEXT_MESSAGE_APP default
 
 
 import time
@@ -233,6 +233,8 @@ class AALNPv2_Enhanced:
         self.command_prefix = self.config.get('commands', {}).get('prefix', '/aalnp')
         # Lock for potentially concurrent config access (e.g., saving from command thread)
         self.config_lock = threading.Lock()
+        # Store last display content for inspection/debugging
+        self._last_display = []
 
         # Initialize features based on loaded config
         self._init_geofences()
@@ -825,14 +827,39 @@ class AALNPv2_Enhanced:
                     # if len(payload_bytes) > max_safe_payload:
                     #    logger.warning(f"Payload size ({len(payload_bytes)} bytes) exceeds safe limit ({max_safe_payload}). May fail.")
 
-                    # Sending logic: Currently always sends as broadcast on DATA_APP port
-                    # TODO: Implement direct messaging if needed, using destination_node
-                    if msg_type == "direct": # and destination_node is not None:
-                         logger.warning("Direct message sending not implemented. Sending as broadcast.")
-                         # Example if API supports hex ID:
-                         # success = self.interface.sendData(payload_bytes, destinationId=f"!{destination_node:08x}", portNum=DATA_APP_PORT, wantAck=True)
-                         # logger.info(f"Attempted direct send to !{destination_node:08x}. Success: {success}")
-                         self.interface.sendData(payload_bytes, portNum=DATA_APP_PORT) # Fallback broadcast
+                    # Sending logic: support both broadcast and direct messaging
+                    if msg_type == "direct":
+                        destination_node = item.get('destination')
+                        if destination_node is None:
+                            logger.warning("Direct message requested but no 'destination' provided — sending as broadcast.")
+                            self.interface.sendData(payload_bytes, portNum=DATA_APP_PORT, channelIndex=0)
+                        else:
+                            # Normalize destination to '!aabbccdd' string when possible
+                            try:
+                                if isinstance(destination_node, str):
+                                    ds = destination_node.strip()
+                                    if ds.startswith('!'):
+                                        dest_id = ds
+                                    elif ds.lower().startswith('0x'):
+                                        dest_id = f"!{int(ds,16):08x}"
+                                    else:
+                                        # assume decimal string
+                                        dest_id = f"!{int(ds):08x}"
+                                elif isinstance(destination_node, int):
+                                    dest_id = f"!{destination_node:08x}"
+                                else:
+                                    dest_id = str(destination_node)
+
+                                # Request ACK for direct sends when supported
+                                self.interface.sendData(payload_bytes, destinationId=dest_id, portNum=DATA_APP_PORT, wantAck=True, channelIndex=0)
+                                logger.debug(f"Sent direct message to {dest_id} ({len(payload_bytes)} bytes)")
+                            except Exception as e:
+                                logger.error(f"Failed to send direct message to {destination_node}: {e}", exc_info=True)
+                                # Fallback to broadcast if direct send fails
+                                try:
+                                    self.interface.sendData(payload_bytes, portNum=DATA_APP_PORT, channelIndex=0)
+                                except Exception as e2:
+                                    logger.error(f"Fallback broadcast also failed: {e2}")
                     else: # Default to broadcast
                         self.interface.sendData(payload_bytes, portNum=DATA_APP_PORT, channelIndex=0) # Send on primary channel
                         logger.debug(f"Published broadcast msg type:'{payload.get('type')}' reason:'{reason}' ({len(payload_bytes)} bytes)")
@@ -979,9 +1006,44 @@ class AALNPv2_Enhanced:
 
             # 3. Optionally Handle/Ignore Other Ports (like standard POSITION_APP)
             elif port_num == POSITION_APP_PORT:
-                 # Decide whether to process standard Meshtastic position packets
-                 # logger.debug(f"Ignoring standard Meshtastic position packet from {sender_id_hex or 'Unknown'}")
-                 pass # Currently ignoring
+                 # Attempt to parse standard Meshtastic position packet and treat it as an AALNP location
+                 try:
+                     pos_payload = None
+                     # Check decoded.position dict
+                     if isinstance(decoded_info.get('position'), dict):
+                         pos_payload = decoded_info.get('position')
+                     # Some versions expose latitude/longitude at top-level of decoded
+                     elif 'latitude' in decoded_info and 'longitude' in decoded_info:
+                         pos_payload = {k: decoded_info.get(k) for k in ('latitude','longitude','altitude','time','accuracy','speed','heading') if k in decoded_info}
+                     # Fall back to trying to decode payload bytes as JSON
+                     elif isinstance(payload_bytes, bytes):
+                         try:
+                             parsed = json.loads(payload_bytes.decode('utf-8'))
+                             if isinstance(parsed, dict) and ('lat' in parsed or 'latitude' in parsed):
+                                 pos_payload = parsed
+                         except Exception:
+                             pos_payload = None
+
+                     if pos_payload and (('latitude' in pos_payload) or ('lat' in pos_payload)):
+                         lat = pos_payload.get('latitude', pos_payload.get('lat'))
+                         lon = pos_payload.get('longitude', pos_payload.get('lon'))
+                         synthetic = {
+                             'type': 'aalnp_loc',
+                             'node': sender_id_raw,
+                             'lat': lat,
+                             'lon': lon,
+                             'alt': pos_payload.get('altitude', pos_payload.get('alt')),
+                             'spd': pos_payload.get('speed'),
+                             'hdg': pos_payload.get('heading'),
+                             'acc': pos_payload.get('accuracy'),
+                             'ts': pos_payload.get('time')
+                         }
+                         # Reuse existing location packet handler for consistency
+                         self._handle_location_packet(synthetic, sender_id_raw, rssi, snr)
+                     else:
+                         logger.debug(f"Ignoring standard Meshtastic position packet from {sender_id_hex or 'Unknown'} (no usable position).")
+                 except Exception as e:
+                     logger.error(f"Error processing standard POSITION_APP packet from {sender_id_hex or 'Unknown'}: {e}", exc_info=True)
                  return
 
             # 4. Ignore packets on other ports not handled above
@@ -1116,6 +1178,141 @@ class AALNPv2_Enhanced:
         else:
              # Log if the request was for a different node
              logger.debug(f"Location request was for {target_node_hex}, not this node ({format_node_id(self.node_num)}). Ignoring.")
+
+
+    def _check_proximity(self, pos):
+        """Return closest node within proximity alert radius (and not on cooldown).
+        Returns {'id': node_id, 'dist': meters, 'meta': meta} or None if no alert triggered.
+        """
+        try:
+            prox_conf = self.config.get('proximity_alert', {})
+            if not prox_conf.get('enabled', False):
+                return None
+
+            threshold_m = float(prox_conf.get('distance_m', 500))
+            cooldown_s = float(prox_conf.get('alert_interval_s', 60))
+
+            lat = safe_get(pos, 'latitude', safe_get(pos, 'lat'))
+            lon = safe_get(pos, 'longitude', safe_get(pos, 'lon'))
+            if lat is None or lon is None:
+                return None
+
+            closest_node = None
+            closest_dist = float('inf')
+            for node_id, node_data in self.other_nodes_location.items():
+                node_lat = safe_get(node_data, 'lat', safe_get(node_data, 'latitude'))
+                node_lon = safe_get(node_data, 'lon', safe_get(node_data, 'longitude'))
+                if node_lat is None or node_lon is None:
+                    continue
+                try:
+                    d = haversine((float(lat), float(lon)), (float(node_lat), float(node_lon)), unit=Unit.METERS)
+                except Exception:
+                    continue
+                if d < closest_dist:
+                    closest_dist = d
+                    closest_node = node_id
+
+            if closest_node is None or closest_dist > threshold_m:
+                return None
+
+            now = time.time()
+            last_ts = self.proximity_alert_timestamps.get(closest_node, 0)
+            if (now - last_ts) < cooldown_s:
+                # Suppress repeated alerts for the same node during cooldown
+                logger.debug(f"Proximity alert for {format_node_id(closest_node)} suppressed by cooldown ({now-last_ts:.0f}s<{cooldown_s}s).")
+                return None
+
+            # Record the alert timestamp and return info
+            self.proximity_alert_timestamps[closest_node] = now
+            meta = self.other_nodes_location.get(closest_node, {}).get('meta', '')
+            logger.info(f"Proximity alert: Node {format_node_id(closest_node)} is {closest_dist:.0f}m away (threshold {threshold_m}m).")
+            return {'id': closest_node, 'dist': closest_dist, 'meta': meta}
+        except Exception as e:
+            logger.error(f"Error in _check_proximity: {e}", exc_info=True)
+            return None
+
+
+    def _check_geofence(self, pos):
+        """Check configured geofences and update states.
+        Returns a short status string for display (e.g. 'IN:Home') or empty string if none.
+        """
+        if not HAS_SHAPELY or not self.geofence_polygons:
+            return ""
+        lat = safe_get(pos, 'latitude', safe_get(pos, 'lat'))
+        lon = safe_get(pos, 'longitude', safe_get(pos, 'lon'))
+        if lat is None or lon is None:
+            return ""
+
+        try:
+            pt = ShapelyPoint(float(lon), float(lat))
+            inside_names = []
+            for name, polygon in self.geofence_polygons.items():
+                if polygon is None:
+                    continue
+                prev_state = self.geofence_states.get(name, 'unknown')
+                try:
+                    inside = polygon.contains(pt) or polygon.touches(pt) or polygon.covers(pt)
+                except Exception as e:
+                    logger.error(f"Error evaluating geo-fence '{name}': {e}")
+                    continue
+
+                if inside:
+                    if prev_state != 'inside':
+                        logger.info(f"Entered geo-fence '{name}'.")
+                    self.geofence_states[name] = 'inside'
+                    inside_names.append(name)
+                else:
+                    if prev_state == 'inside':
+                        logger.info(f"Exited geo-fence '{name}'.")
+                    self.geofence_states[name] = 'outside'
+
+            # Return a compact display string for the first matching fence
+            return f"IN:{inside_names[0][:12]}" if inside_names else ""
+        except Exception as e:
+            logger.error(f"Error in _check_geofence: {e}", exc_info=True)
+            return ""
+
+
+    def _update_display(self, nav_info_str, prox_alert_node_id, prox_alert_dist, fence_status_str, pos):
+        """Update an attached display (best-effort) and store last display lines for inspection.
+        If no physical display is available, this simply logs the intended content.
+        """
+        try:
+            lines = []
+            if nav_info_str:
+                lines.append(nav_info_str)
+            else:
+                lat = safe_get(pos, 'latitude', safe_get(pos, 'lat'))
+                lon = safe_get(pos, 'longitude', safe_get(pos, 'lon'))
+                if lat is not None and lon is not None:
+                    lines.append(f"{lat:.5f},{lon:.5f}")
+                else:
+                    lines.append("No GPS Fix")
+
+            if prox_alert_node_id:
+                lines.append(f"Near {format_node_id(prox_alert_node_id)} {prox_alert_dist:.0f}m")
+            elif fence_status_str:
+                lines.append(fence_status_str)
+            else:
+                lines.append(self.config.get('node_metadata','')[:16])
+
+            # Save last display content (useful for tests/inspection)
+            self._last_display = lines
+
+            # Best-effort: if the meshtastic interface exposes a display API, try to use it
+            try:
+                if hasattr(self.interface, 'setDisplay'):
+                    # Some custom interfaces may implement a setDisplay(text) convenience method
+                    self.interface.setDisplay('\n'.join(lines))
+                elif hasattr(self.interface, 'displayUpdate'):
+                    self.interface.displayUpdate(lines)
+            except Exception:
+                # Do not raise if display update fails on devices with no display
+                logger.debug("Physical display update failed or not supported (ignored).")
+
+            logger.debug("Display content: %s", " | ".join(lines))
+        except Exception as e:
+            logger.error(f"Error in _update_display: {e}", exc_info=True)
 
 
     # --- Text Command Handling ---

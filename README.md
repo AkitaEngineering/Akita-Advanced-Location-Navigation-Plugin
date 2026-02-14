@@ -35,9 +35,9 @@ Meshtastic is great for off-grid communication, but basic location sharing can b
 
 1.  **Install Dependencies:**
     ```bash
-    pip install meshtastic geomet haversine shapely
+    pip install meshtastic haversine shapely
     ```
-    *(Requires `geomet`, `haversine`, and `shapely`)*
+    *(Requires `haversine` and `shapely`; `geomet` is optional and not used)*
 2.  **Place Files:** Copy `aalnp_v2_enhanced.py` (or rename) and create/update `aalnp_config.json` (see below) in your runtime directory.
 3.  **Run:** Execute the script.
     ```bash
@@ -135,9 +135,9 @@ Send commands via Meshtastic text message (e.g., using the app or another device
 
 - Python 3.7+
 - `meshtastic`
-- `geomet`
 - `haversine`
-- `shapely`
+- `shapely` (for geo-fencing)
+- `geomet` (optional, not used in current implementation)
 
 ---
 
