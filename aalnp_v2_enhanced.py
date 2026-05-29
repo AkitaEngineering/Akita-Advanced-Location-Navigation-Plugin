@@ -62,6 +62,17 @@ import collections # For deque (track storage)
 from datetime import datetime, timezone # For display timestamp
 from haversine import haversine, Unit # For distance calculations
 
+try:
+    import tkinter as tk
+    from tkinter import messagebox
+    from tkinter.scrolledtext import ScrolledText
+    HAS_TKINTER = True
+except ImportError:
+    tk = None
+    messagebox = None
+    ScrolledText = None
+    HAS_TKINTER = False
+
 # Attempt to import Shapely for Geo-fencing
 try:
     from shapely.geometry import Point as ShapelyPoint
@@ -179,6 +190,27 @@ def format_node_id(node_num):
     except (ValueError, TypeError):
         # Fallback if conversion fails
         return str(node_num)
+
+
+class AALNPGuiLogHandler(logging.Handler):
+    """Keeps a short in-memory log history for the optional desktop GUI."""
+
+    def __init__(self, max_entries=250):
+        super().__init__()
+        self.records = collections.deque(maxlen=max_entries)
+        self.records_lock = threading.Lock()
+
+    def emit(self, record):
+        try:
+            message = self.format(record)
+        except Exception:
+            message = record.getMessage()
+        with self.records_lock:
+            self.records.append(message)
+
+    def get_lines(self):
+        with self.records_lock:
+            return list(self.records)
 
 
 # --- Main Plugin Class ---
@@ -1312,6 +1344,94 @@ class AALNPv2_Enhanced:
         except Exception as e:
             logger.error(f"Error in _update_display: {e}", exc_info=True)
 
+    def get_runtime_snapshot(self):
+        """Return a GUI-friendly snapshot of the current plugin state."""
+        with self.config_lock:
+            config_copy = json.loads(json.dumps(self.config))
+
+        now = time.time()
+        pos = self.last_pos.copy() if isinstance(self.last_pos, dict) else {}
+        lat = safe_get(pos, 'latitude', safe_get(pos, 'lat'))
+        lon = safe_get(pos, 'longitude', safe_get(pos, 'lon'))
+
+        navigation = None
+        waypoint = config_copy.get('waypoint') if isinstance(config_copy.get('waypoint'), dict) else None
+        if waypoint and lat is not None and lon is not None:
+            wp_lat = safe_get(waypoint, 'latitude')
+            wp_lon = safe_get(waypoint, 'longitude')
+            if wp_lat is not None and wp_lon is not None:
+                try:
+                    distance_m = haversine((float(lat), float(lon)), (float(wp_lat), float(wp_lon)), unit=Unit.METERS)
+                    bearing_deg = calculate_bearing(float(lat), float(lon), float(wp_lat), float(wp_lon))
+                    navigation = {
+                        "distance_m": distance_m,
+                        "bearing_deg": bearing_deg,
+                        "waypoint_name": safe_get(waypoint, 'name', 'WP'),
+                    }
+                except Exception:
+                    navigation = None
+
+        other_nodes = []
+        for node_id, node_data in list(self.other_nodes_location.items()):
+            entry = node_data.copy() if isinstance(node_data, dict) else {}
+            entry['node_id'] = node_id
+            entry['node_id_hex'] = format_node_id(node_id)
+            rx_ts = safe_get(entry, 'rx_ts')
+            entry['age_s'] = max(0.0, now - float(rx_ts)) if rx_ts else None
+
+            node_lat = safe_get(entry, 'lat', safe_get(entry, 'latitude'))
+            node_lon = safe_get(entry, 'lon', safe_get(entry, 'longitude'))
+            if lat is not None and lon is not None and node_lat is not None and node_lon is not None:
+                try:
+                    entry['distance_m'] = haversine((float(lat), float(lon)), (float(node_lat), float(node_lon)), unit=Unit.METERS)
+                except Exception:
+                    entry['distance_m'] = None
+            else:
+                entry['distance_m'] = None
+            other_nodes.append(entry)
+
+        other_nodes.sort(key=lambda item: safe_get(item, 'rx_ts', 0) or 0, reverse=True)
+
+        try:
+            queue_depth = self.msg_queue.qsize()
+        except Exception:
+            queue_depth = 0
+
+        return {
+            "running": self.running,
+            "connected": self.running and self.node_num is not None,
+            "node_num": self.node_num,
+            "node_id_hex": format_node_id(self.node_num),
+            "tx_delay_ms": self.tx_delay_ms,
+            "queue_depth": queue_depth,
+            "speed_mps": self.current_speed_mps,
+            "position": pos,
+            "position_fix": lat is not None and lon is not None,
+            "metadata": config_copy.get('node_metadata', ''),
+            "command_prefix": config_copy.get('commands', {}).get('prefix', '/aalnp'),
+            "waypoint": waypoint,
+            "navigation": navigation,
+            "other_nodes": other_nodes,
+            "heard_count": len(other_nodes),
+            "display_lines": list(self._last_display),
+            "geofence_states": dict(self.geofence_states),
+            "last_broadcast_age_s": (now - self.last_broadcast_time) if self.last_broadcast_time else None,
+            "log_file": config_copy.get('log_file'),
+            "config_path": self.config_path,
+        }
+
+    def set_waypoint(self, name, latitude, longitude):
+        """Public helper used by the desktop GUI to set waypoint config."""
+        return self._cmd_set_wp([name, str(latitude), str(longitude)])
+
+    def clear_waypoint(self):
+        """Public helper used by the desktop GUI to clear waypoint config."""
+        return self._cmd_clear_wp()
+
+    def set_metadata(self, metadata):
+        """Public helper used by the desktop GUI to update node metadata."""
+        return self._cmd_set_meta([metadata])
+
 
     # --- Text Command Handling ---
     def _handle_text_command(self, text, sender_id_raw):
@@ -1687,6 +1807,413 @@ class AALNPv2_Enhanced:
             self.node_num = None # Reset node ID as we are disconnected
 
 
+class AALNPDesktopGUI:
+    """Optional local desktop console for monitoring and editing AALNP state."""
+
+    def __init__(self, plugin, log_handler):
+        if not HAS_TKINTER:
+            raise RuntimeError("Tkinter is not available in this Python environment.")
+
+        self.plugin = plugin
+        self.log_handler = log_handler
+        self.root = tk.Tk()
+        self.root.title("Akita AALNP // Titanium Console")
+        self.root.geometry("1360x920")
+        self.root.minsize(1220, 820)
+
+        self.colors = {
+            "bg": "#07090b",
+            "panel": "#101318",
+            "surface": "#191e24",
+            "surface_2": "#252c34",
+            "border": "#59616a",
+            "silver": "#c2cad2",
+            "white": "#f5f7fa",
+            "accent": "#39e67d",
+            "accent_2": "#1f8b50",
+            "muted": "#8a929a",
+            "titanium": "#7a838d",
+        }
+        self.root.configure(bg=self.colors["bg"])
+
+        self.font_family = "DejaVu Sans"
+        self.mono_family = "DejaVu Sans Mono"
+        self.status_widgets = {}
+        self.metric_widgets = {}
+        self.last_logs_text = None
+        self.last_nodes_text = None
+        self.last_display_text = None
+        self._closed = False
+
+        self._build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def f(self, size, weight="normal"):
+        return (self.font_family, size, weight)
+
+    def fm(self, size, weight="bold"):
+        return (self.mono_family, size, weight)
+
+    def _badge_palette(self, tone):
+        tones = {
+            "neutral": (self.colors["surface"], self.colors["silver"]),
+            "muted": (self.colors["surface"], self.colors["muted"]),
+            "active": (self.colors["surface"], self.colors["accent"]),
+            "bright": (self.colors["white"], self.colors["bg"]),
+        }
+        return tones.get(tone, tones["neutral"])
+
+    def _make_badge(self, parent, text, tone="neutral"):
+        bg, fg = self._badge_palette(tone)
+        return tk.Label(parent, text=text, font=self.f(10, "bold"), bg=bg, fg=fg, padx=12, pady=6)
+
+    def _set_badge(self, widget, text, tone="neutral"):
+        bg, fg = self._badge_palette(tone)
+        widget.config(text=text, bg=bg, fg=fg)
+
+    def _make_card(self, parent, title, subtitle=None):
+        card = tk.Frame(
+            parent,
+            bg=self.colors["panel"],
+            highlightbackground=self.colors["border"],
+            highlightcolor=self.colors["border"],
+            highlightthickness=1,
+            bd=0,
+        )
+        tk.Frame(card, bg=self.colors["accent"], height=3).pack(fill=tk.X)
+        header = tk.Frame(card, bg=self.colors["panel"])
+        header.pack(fill=tk.X, padx=16, pady=(14, 10))
+        tk.Label(header, text=title.upper(), font=self.f(11, "bold"), fg=self.colors["white"], bg=self.colors["panel"]).pack(anchor="w")
+        if subtitle:
+            tk.Label(header, text=subtitle, font=self.f(9), fg=self.colors["silver"], bg=self.colors["panel"]).pack(anchor="w", pady=(4, 0))
+        body = tk.Frame(card, bg=self.colors["panel"])
+        body.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 16))
+        return card, body
+
+    def _make_metric_tile(self, parent, title, row, col):
+        tile = tk.Frame(
+            parent,
+            bg=self.colors["surface"],
+            highlightbackground=self.colors["border"],
+            highlightcolor=self.colors["border"],
+            highlightthickness=1,
+            bd=0,
+        )
+        tile.grid(row=row, column=col, sticky="nsew", padx=6, pady=6)
+        tk.Label(tile, text=title.upper(), font=self.f(8, "bold"), fg=self.colors["silver"], bg=self.colors["surface"]).pack(anchor="w", padx=12, pady=(10, 4))
+        value = tk.Label(tile, text="--", font=self.fm(14), fg=self.colors["white"], bg=self.colors["surface"])
+        value.pack(anchor="w", padx=12, pady=(0, 10))
+        return value
+
+    def _make_button(self, parent, text, command, tone="secondary"):
+        palettes = {
+            "secondary": (self.colors["surface_2"], self.colors["white"], self.colors["titanium"]),
+            "primary": (self.colors["accent"], self.colors["bg"], "#6ff0a3"),
+            "bright": (self.colors["white"], self.colors["bg"], self.colors["silver"]),
+        }
+        bg, fg, hover = palettes.get(tone, palettes["secondary"])
+        button = tk.Button(
+            parent,
+            text=text,
+            command=command,
+            font=self.f(9, "bold"),
+            bg=bg,
+            fg=fg,
+            activebackground=hover,
+            activeforeground=fg,
+            relief=tk.FLAT,
+            bd=0,
+            highlightthickness=0,
+            padx=14,
+            pady=10,
+            cursor="hand2",
+        )
+        button.bind("<Enter>", lambda _event, btn=button, color=hover: btn.config(bg=color))
+        button.bind("<Leave>", lambda _event, btn=button, color=bg: btn.config(bg=color))
+        return button
+
+    def _style_entry(self, entry):
+        entry.config(
+            bg=self.colors["surface"],
+            fg=self.colors["white"],
+            insertbackground=self.colors["white"],
+            relief=tk.FLAT,
+            highlightthickness=1,
+            highlightbackground=self.colors["border"],
+            highlightcolor=self.colors["accent"],
+            font=self.f(10),
+        )
+
+    def _set_text_widget(self, widget, content):
+        widget.config(state=tk.NORMAL)
+        widget.delete("1.0", tk.END)
+        widget.insert("1.0", content)
+        widget.config(state=tk.DISABLED)
+
+    def _build_ui(self):
+        shell = tk.Frame(self.root, bg=self.colors["bg"])
+        shell.pack(fill=tk.BOTH, expand=True, padx=18, pady=18)
+
+        header_card, header_body = self._make_card(
+            shell,
+            "Akita AALNP",
+            "Advanced location, navigation, geofence, and mesh activity console.",
+        )
+        header_card.pack(fill=tk.X, pady=(0, 14))
+        header_body.grid_columnconfigure(0, weight=1)
+
+        left_header = tk.Frame(header_body, bg=self.colors["panel"])
+        left_header.grid(row=0, column=0, sticky="w")
+        tk.Label(left_header, text="TITANIUM MESH CONSOLE", font=self.f(24, "bold"), fg=self.colors["white"], bg=self.colors["panel"]).pack(anchor="w")
+        tk.Label(left_header, text="AALNP desktop view for local status, nearby nodes, navigation, and device display output.", font=self.f(10), fg=self.colors["silver"], bg=self.colors["panel"]).pack(anchor="w", pady=(4, 10))
+        badge_row = tk.Frame(left_header, bg=self.colors["panel"])
+        badge_row.pack(anchor="w")
+        self.status_widgets["connection"] = self._make_badge(badge_row, "WAITING FOR MESH", "muted")
+        self.status_widgets["connection"].pack(side=tk.LEFT, padx=(0, 8))
+        self.status_widgets["node"] = self._make_badge(badge_row, "NODE: UNKNOWN", "neutral")
+        self.status_widgets["node"].pack(side=tk.LEFT, padx=(0, 8))
+        self.status_widgets["prefix"] = self._make_badge(badge_row, "PREFIX: /aalnp", "neutral")
+        self.status_widgets["prefix"].pack(side=tk.LEFT)
+
+        right_header = tk.Frame(header_body, bg=self.colors["panel"])
+        right_header.grid(row=0, column=1, sticky="e")
+        self.status_widgets["running"] = self._make_badge(right_header, "STATE: IDLE", "muted")
+        self.status_widgets["running"].pack(anchor="e", pady=(0, 8))
+        self.status_widgets["feedback"] = self._make_badge(right_header, "CONFIG PATH READY", "neutral")
+        self.status_widgets["feedback"].pack(anchor="e")
+
+        content = tk.Frame(shell, bg=self.colors["bg"])
+        content.pack(fill=tk.BOTH, expand=True)
+        content.grid_columnconfigure(0, weight=11)
+        content.grid_columnconfigure(1, weight=9)
+        content.grid_rowconfigure(1, weight=1)
+
+        left_col = tk.Frame(content, bg=self.colors["bg"])
+        left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        right_col = tk.Frame(content, bg=self.colors["bg"])
+        right_col.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+
+        summary_card, summary_body = self._make_card(left_col, "Runtime Summary", "Live node, queue, position, and broadcast metrics.")
+        summary_card.pack(fill=tk.X, pady=(0, 14))
+        for row in range(2):
+            summary_body.grid_rowconfigure(row, weight=1)
+        for col in range(4):
+            summary_body.grid_columnconfigure(col, weight=1)
+        summary_titles = [
+            ("Local Node", 0, 0),
+            ("Queue Depth", 0, 1),
+            ("Nodes Heard", 0, 2),
+            ("TX Delay", 0, 3),
+            ("Latitude", 1, 0),
+            ("Longitude", 1, 1),
+            ("Speed", 1, 2),
+            ("Last Broadcast", 1, 3),
+        ]
+        for title, row, col in summary_titles:
+            self.metric_widgets[title] = self._make_metric_tile(summary_body, title, row, col)
+
+        controls_card, controls_body = self._make_card(left_col, "Config Controls", "Update metadata and waypoint settings stored in aalnp_config.json.")
+        controls_card.pack(fill=tk.BOTH, expand=True)
+        controls_body.grid_columnconfigure(1, weight=1)
+        tk.Label(controls_body, text="NODE METADATA", font=self.f(8, "bold"), fg=self.colors["silver"], bg=self.colors["panel"]).grid(row=0, column=0, sticky="w", pady=(0, 6))
+        self.metadata_entry = tk.Entry(controls_body)
+        self._style_entry(self.metadata_entry)
+        self.metadata_entry.grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=(0, 6))
+        self._make_button(controls_body, "APPLY METADATA", self._apply_metadata, tone="primary").grid(row=0, column=2, sticky="ew", pady=(0, 6))
+
+        tk.Label(controls_body, text="WAYPOINT NAME", font=self.f(8, "bold"), fg=self.colors["silver"], bg=self.colors["panel"]).grid(row=1, column=0, sticky="w", pady=6)
+        self.wp_name_entry = tk.Entry(controls_body)
+        self._style_entry(self.wp_name_entry)
+        self.wp_name_entry.grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=6)
+
+        tk.Label(controls_body, text="LATITUDE", font=self.f(8, "bold"), fg=self.colors["silver"], bg=self.colors["panel"]).grid(row=2, column=0, sticky="w", pady=6)
+        self.wp_lat_entry = tk.Entry(controls_body)
+        self._style_entry(self.wp_lat_entry)
+        self.wp_lat_entry.grid(row=2, column=1, sticky="ew", padx=(0, 10), pady=6)
+
+        tk.Label(controls_body, text="LONGITUDE", font=self.f(8, "bold"), fg=self.colors["silver"], bg=self.colors["panel"]).grid(row=3, column=0, sticky="w", pady=6)
+        self.wp_lon_entry = tk.Entry(controls_body)
+        self._style_entry(self.wp_lon_entry)
+        self.wp_lon_entry.grid(row=3, column=1, sticky="ew", padx=(0, 10), pady=6)
+
+        button_row = tk.Frame(controls_body, bg=self.colors["panel"])
+        button_row.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        self._make_button(button_row, "SET WAYPOINT", self._apply_waypoint, tone="primary").pack(side=tk.LEFT, padx=(0, 8))
+        self._make_button(button_row, "CLEAR WAYPOINT", self._clear_waypoint, tone="secondary").pack(side=tk.LEFT)
+
+        display_card, display_body = self._make_card(right_col, "Navigation & Display", "Waypoint solution, geofence state, metadata, and OLED preview text.")
+        display_card.pack(fill=tk.X, pady=(0, 14))
+        self.metric_widgets["Navigation"] = self._make_metric_tile(display_body, "Navigation", 0, 0)
+        self.metric_widgets["Geofences"] = self._make_metric_tile(display_body, "Geofences", 0, 1)
+        display_body.grid_columnconfigure(0, weight=1)
+        display_body.grid_columnconfigure(1, weight=1)
+        tk.Label(display_body, text="DISPLAY PREVIEW", font=self.f(8, "bold"), fg=self.colors["silver"], bg=self.colors["panel"]).grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 6))
+        self.display_preview = tk.Label(display_body, text="No display output yet.", justify=tk.LEFT, anchor="w", font=self.fm(11, "normal"), fg=self.colors["white"], bg=self.colors["surface"], padx=12, pady=12)
+        self.display_preview.grid(row=2, column=0, columnspan=2, sticky="ew")
+
+        nodes_card, nodes_body = self._make_card(right_col, "Nearby Nodes", "Recently heard nodes sorted by most recent reception.")
+        nodes_card.pack(fill=tk.BOTH, expand=True)
+        self.nodes_text = ScrolledText(
+            nodes_body,
+            wrap=tk.NONE,
+            height=16,
+            bg=self.colors["surface"],
+            fg=self.colors["white"],
+            insertbackground=self.colors["white"],
+            relief=tk.FLAT,
+            highlightthickness=1,
+            highlightbackground=self.colors["border"],
+            highlightcolor=self.colors["accent"],
+            font=self.fm(10, "normal"),
+        )
+        self.nodes_text.pack(fill=tk.BOTH, expand=True)
+        self.nodes_text.config(state=tk.DISABLED)
+
+        log_card, log_body = self._make_card(shell, "Recent Activity", "Live AALNP and Meshtastic log stream for local inspection.")
+        log_card.pack(fill=tk.BOTH, expand=True, pady=(14, 0))
+        self.log_text = ScrolledText(
+            log_body,
+            wrap=tk.WORD,
+            height=12,
+            bg=self.colors["surface"],
+            fg=self.colors["white"],
+            insertbackground=self.colors["white"],
+            relief=tk.FLAT,
+            highlightthickness=1,
+            highlightbackground=self.colors["border"],
+            highlightcolor=self.colors["accent"],
+            font=self.fm(10, "normal"),
+        )
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+        self.log_text.config(state=tk.DISABLED)
+
+    def _set_feedback(self, message, tone="neutral"):
+        message = (message or "Ready").replace("\n", " | ")
+        self._set_badge(self.status_widgets["feedback"], message[:72], tone)
+
+    def _apply_metadata(self):
+        metadata = self.metadata_entry.get().strip()
+        response = self.plugin.set_metadata(metadata)
+        tone = "active" if response.startswith("Metadata set") or response.startswith("WARN") else "bright"
+        self._set_feedback(response, tone)
+        self.refresh(force_sync_inputs=True)
+
+    def _apply_waypoint(self):
+        name = self.wp_name_entry.get().strip()
+        lat = self.wp_lat_entry.get().strip()
+        lon = self.wp_lon_entry.get().strip()
+        if not name:
+            self._set_feedback("Waypoint name is required.", "bright")
+            return
+        response = self.plugin.set_waypoint(name, lat, lon)
+        tone = "active" if response.endswith("set.") else "bright"
+        self._set_feedback(response, tone)
+        self.refresh(force_sync_inputs=True)
+
+    def _clear_waypoint(self):
+        response = self.plugin.clear_waypoint()
+        tone = "muted" if response == "Waypoint cleared." else "bright"
+        self._set_feedback(response, tone)
+        self.refresh(force_sync_inputs=True)
+
+    def _sync_inputs_from_snapshot(self, snapshot):
+        metadata = snapshot.get("metadata", "")
+        if self.metadata_entry.get().strip() != metadata and self.root.focus_get() is not self.metadata_entry:
+            self.metadata_entry.delete(0, tk.END)
+            self.metadata_entry.insert(0, metadata)
+
+        waypoint = snapshot.get("waypoint") or {}
+        if self.root.focus_get() is not self.wp_name_entry:
+            self.wp_name_entry.delete(0, tk.END)
+            self.wp_name_entry.insert(0, safe_get(waypoint, 'name', ''))
+        if self.root.focus_get() is not self.wp_lat_entry:
+            self.wp_lat_entry.delete(0, tk.END)
+            lat = safe_get(waypoint, 'latitude', '')
+            self.wp_lat_entry.insert(0, "" if lat == '' else str(lat))
+        if self.root.focus_get() is not self.wp_lon_entry:
+            self.wp_lon_entry.delete(0, tk.END)
+            lon = safe_get(waypoint, 'longitude', '')
+            self.wp_lon_entry.insert(0, "" if lon == '' else str(lon))
+
+    def refresh(self, force_sync_inputs=False):
+        snapshot = self.plugin.get_runtime_snapshot()
+        connected = snapshot.get("connected", False)
+        running = snapshot.get("running", False)
+
+        self._set_badge(self.status_widgets["connection"], "LINKED TO MESH" if connected else "WAITING FOR MESH", "active" if connected else "muted")
+        self._set_badge(self.status_widgets["node"], f"NODE: {snapshot.get('node_id_hex', 'Unknown')}", "bright" if connected else "neutral")
+        self._set_badge(self.status_widgets["prefix"], f"PREFIX: {snapshot.get('command_prefix', '/aalnp')}", "neutral")
+        self._set_badge(self.status_widgets["running"], f"STATE: {'RUNNING' if running else 'IDLE'}", "active" if running else "muted")
+
+        pos = snapshot.get("position", {}) or {}
+        lat = safe_get(pos, 'latitude', safe_get(pos, 'lat'))
+        lon = safe_get(pos, 'longitude', safe_get(pos, 'lon'))
+        speed = snapshot.get("speed_mps", 0.0) or 0.0
+        last_broadcast_age = snapshot.get("last_broadcast_age_s")
+        self.metric_widgets["Local Node"].config(text=snapshot.get("node_id_hex", "Unknown"))
+        self.metric_widgets["Queue Depth"].config(text=str(snapshot.get("queue_depth", 0)))
+        self.metric_widgets["Nodes Heard"].config(text=str(snapshot.get("heard_count", 0)))
+        self.metric_widgets["TX Delay"].config(text=f"{snapshot.get('tx_delay_ms', 0)} ms")
+        self.metric_widgets["Latitude"].config(text="--" if lat is None else f"{float(lat):.6f}")
+        self.metric_widgets["Longitude"].config(text="--" if lon is None else f"{float(lon):.6f}")
+        self.metric_widgets["Speed"].config(text=f"{speed:.2f} m/s")
+        self.metric_widgets["Last Broadcast"].config(text="--" if last_broadcast_age is None else f"{last_broadcast_age:.0f}s ago")
+
+        nav = snapshot.get("navigation")
+        if nav:
+            self.metric_widgets["Navigation"].config(text=f"{nav.get('waypoint_name', 'WP')}  {nav.get('distance_m', 0):.0f}m  {nav.get('bearing_deg', 0):.0f}d", fg=self.colors["accent"])
+        else:
+            self.metric_widgets["Navigation"].config(text="No active waypoint", fg=self.colors["silver"])
+
+        geofences = snapshot.get("geofence_states", {})
+        if geofences:
+            summary = " | ".join(f"{name}:{state}" for name, state in sorted(geofences.items()))
+            self.metric_widgets["Geofences"].config(text=summary[:48], fg=self.colors["white"])
+        else:
+            self.metric_widgets["Geofences"].config(text="No geofences configured", fg=self.colors["silver"])
+
+        display_lines = snapshot.get("display_lines", []) or ["No display output yet."]
+        display_text = "\n".join(display_lines)
+        self.display_preview.config(text=display_text, fg=self.colors["accent"] if snapshot.get("position_fix") else self.colors["silver"])
+
+        node_lines = ["NODE ID        AGE    DIST    META"]
+        for entry in snapshot.get("other_nodes", [])[:12]:
+            age = entry.get("age_s")
+            dist = entry.get("distance_m")
+            meta = (safe_get(entry, 'meta', '') or '').strip()[:22]
+            node_lines.append(
+                f"{entry.get('node_id_hex', 'Unknown'):<13}"
+                f" {('--' if age is None else f'{age:.0f}s'):>5}"
+                f" {('--' if dist is None else f'{dist:.0f}m'):>7}"
+                f"  {meta or '-'}"
+            )
+        nodes_text = "\n".join(node_lines)
+        if nodes_text != self.last_nodes_text:
+            self._set_text_widget(self.nodes_text, nodes_text)
+            self.last_nodes_text = nodes_text
+
+        log_text = "\n".join(self.log_handler.get_lines()[-180:])
+        if log_text != self.last_logs_text:
+            self._set_text_widget(self.log_text, log_text)
+            self.log_text.see(tk.END)
+            self.last_logs_text = log_text
+
+        if force_sync_inputs:
+            self._sync_inputs_from_snapshot(snapshot)
+
+        if not self._closed:
+            self.root.after(1000, self.refresh)
+
+    def _on_close(self):
+        self._closed = True
+        self.root.quit()
+        self.root.destroy()
+
+    def run(self):
+        self.refresh(force_sync_inputs=True)
+        self.root.mainloop()
+
+
 # --- Main Execution Guard ---
 if __name__ == "__main__":
     # --- Main Function Definition ---
@@ -1702,6 +2229,7 @@ if __name__ == "__main__":
         parser.add_argument("--port", default=None, help="Specify the serial port or device address (e.g., /dev/ttyUSB0, COM3, 192.168.x.x)")
         parser.add_argument("--debug", action="store_true", help="Enable DEBUG level logging for AALNPv2.1 and Meshtastic library.")
         parser.add_argument("--no-log", action="store_true", help="Disable GeoJSON logging (overrides config file setting).")
+        parser.add_argument("--gui", action="store_true", help="Launch the optional local desktop console for AALNP state and config.")
         args = parser.parse_args() # Parse arguments from command line
 
         # --- Configure Logging Level ---
@@ -1721,6 +2249,7 @@ if __name__ == "__main__":
         # --- Initialization ---
         interface = None       # Meshtastic interface object
         aalnp_instance = None  # Plugin instance object
+        gui_log_handler = None
 
         try:
             logger.info("--- Akita Advanced Location/Navigation Plugin (AALNP) v2.1 Starting ---")
@@ -1744,6 +2273,14 @@ if __name__ == "__main__":
             # --- Create Plugin Instance ---
             aalnp_instance = AALNPv2_Enhanced(interface, config_path=args.config)
 
+            if args.gui:
+                if not HAS_TKINTER:
+                    raise RuntimeError("Tkinter is not installed. Install the Python Tk package or run without --gui.")
+                gui_log_handler = AALNPGuiLogHandler(max_entries=300)
+                gui_log_handler.setLevel(logging.DEBUG if args.debug else logging.INFO)
+                gui_log_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%H:%M:%S"))
+                logging.getLogger().addHandler(gui_log_handler)
+
             # --- Apply Command-Line Overrides ---
             # Handle --no-log override *after* instance creation and config loading
             if args.no_log:
@@ -1760,13 +2297,17 @@ if __name__ == "__main__":
             logger.info("Press Ctrl+C to exit.")
 
             # --- Main Loop ---
-            # Keep the main thread alive. Background threads handle operations.
-            while True:
-                # Optional: Add checks here if needed (e.g., check interface health)
-                # if not interface or not interface.is_connected:
-                #      logger.warning("Main loop: Interface detected disconnection.")
-                     # Rely on on_connection callback to handle shutdown/restart logic
-                time.sleep(5) # Sleep to reduce CPU usage, wake up periodically
+            if args.gui:
+                gui = AALNPDesktopGUI(aalnp_instance, gui_log_handler)
+                gui.run()
+            else:
+                # Keep the main thread alive. Background threads handle operations.
+                while True:
+                    # Optional: Add checks here if needed (e.g., check interface health)
+                    # if not interface or not interface.is_connected:
+                    #      logger.warning("Main loop: Interface detected disconnection.")
+                         # Rely on on_connection callback to handle shutdown/restart logic
+                    time.sleep(5) # Sleep to reduce CPU usage, wake up periodically
 
         except meshtastic.MeshtasticError as e:
             # Catch specific Meshtastic errors during initialization/connection
@@ -1792,6 +2333,8 @@ if __name__ == "__main__":
             if interface:
                 logger.info("Closing Meshtastic interface...")
                 interface.close()
+            if gui_log_handler:
+                logging.getLogger().removeHandler(gui_log_handler)
             logger.info("Shutdown complete.")
             # Ensure all logs are flushed if using file handlers etc.
             logging.shutdown()

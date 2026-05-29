@@ -5,6 +5,8 @@
 
 AALNP is a significantly enhanced Meshtastic plugin developed by Akita Engineering, focused on providing advanced, practical location sharing, tracking, and simple navigation features over LoRa. Version 2.1 adds interactive commands, display output, geo-fencing, and local track storage.
 
+Version 2.1 also supports an optional local desktop console for live monitoring and configuration. The GUI uses a black, grey, silver, titanium, white, and green palette and can show local status, nearby nodes, navigation info, geofence state, display preview text, and recent AALNP activity.
+
 ## Overview
 
 Meshtastic is great for off-grid communication, but basic location sharing can be improved. The Akita Advanced Location/Navigation Plugin (AALNP) v2.1 transforms your Meshtastic node into a smarter location-aware device. It intelligently broadcasts its location, responds to direct requests, helps you navigate towards waypoints, logs detailed track data, alerts you to nearby teammates, reacts to text commands, shows status on device displays, warns on entering/exiting defined zones, and keeps a short history of received locations, all while respecting the low-bandwidth nature of LoRa.
@@ -38,11 +40,18 @@ Meshtastic is great for off-grid communication, but basic location sharing can b
     pip install meshtastic haversine shapely
     ```
     *(Requires `haversine` and `shapely`; `geomet` is optional and not used)*
+    
+  For the optional desktop GUI, Tkinter must also be available. On many Linux systems that means installing `python3-tk` from the OS package manager.
 2.  **Place Files:** Copy `aalnp_v2_enhanced.py` (or rename) and create/update `aalnp_config.json` (see below) in your runtime directory.
 3.  **Run:** Execute the script.
     ```bash
     python aalnp_v2_enhanced.py [--config PATH_TO_CONFIG] [--port SERIAL_PORT]
     ```
+
+  To launch the desktop GUI:
+  ```bash
+  python aalnp_v2_enhanced.py --gui [--config PATH_TO_CONFIG] [--port SERIAL_PORT]
+  ```
 
 ## Configuration (`aalnp_config.json`)
 
@@ -114,6 +123,16 @@ commands:
 ## Usage & Commands
 
 Run the script. Monitor console output. Visualize the GeoJSON log.
+
+If you start with `--gui`, the desktop console exposes:
+
+- Live node and queue status
+- Current GPS fix, speed, and last broadcast age
+- Waypoint distance and bearing
+- Nearby node summaries
+- Device display preview text
+- Local config controls for metadata and waypoint changes
+- Recent AALNP activity logs
 
 Send commands via Meshtastic text message (e.g., using the app or another device):
 
