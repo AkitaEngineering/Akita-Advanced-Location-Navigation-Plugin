@@ -962,8 +962,7 @@ class AALNPv2_Enhanced:
                 except Exception as e:
                     # Catch errors specifically during text message handling
                     logger.error(f"Error handling text message from {sender_id_hex or 'Unknown'}: {e}", exc_info=True)
-                finally:
-                    return # Don't process text messages further (e.g., as AALNP data)
+                return # Don't process text messages further (e.g., as AALNP data)
 
             # 2. Handle AALNP Data Packets
             elif port_num == DATA_APP_PORT and isinstance(payload_bytes, bytes):
@@ -1001,8 +1000,7 @@ class AALNPv2_Enhanced:
                 except Exception as e:
                     # Catch errors during specific AALNP packet processing
                     logger.error(f"Error processing AALNP DATA_APP packet from {sender_id_hex or 'Unknown'}: {e}", exc_info=True)
-                finally:
-                    return # Processed DATA_APP packet
+                return # Processed DATA_APP packet
 
             # 3. Optionally Handle/Ignore Other Ports (like standard POSITION_APP)
             elif port_num == POSITION_APP_PORT:
