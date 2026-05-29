@@ -1926,6 +1926,8 @@ class AALNPDesktopGUI:
         self.last_nodes_text = None
         self.last_geojson_text = None
         self.last_detail_text = None
+        self.map_node_hits = []
+        self.pending_selected_node_hex = None
         self.filtered_nodes = []
         self._refresh_job = None
         self._closed = False
@@ -2109,6 +2111,7 @@ class AALNPDesktopGUI:
             highlightcolor=self.colors["accent"],
         )
         self.map_canvas.pack(fill=tk.X)
+        self.map_canvas.bind("<Button-1>", self._handle_map_click)
         tk.Label(
             map_body,
             text="YOU  recent trail  waypoint  nearby nodes",
@@ -2320,6 +2323,45 @@ class AALNPDesktopGUI:
         self.request_node_entry.delete(0, tk.END)
         self.request_node_entry.insert(0, node_hex)
 
+    def _select_node_by_hex(self, node_hex):
+        if not node_hex:
+            return False
+
+        for index, entry in enumerate(self.filtered_nodes):
+            if entry.get("node_id_hex") == node_hex:
+                self.nodes_list.selection_clear(0, tk.END)
+                self.nodes_list.selection_set(index)
+                self.nodes_list.see(index)
+                self._update_request_target_from_selection()
+                return True
+
+        return False
+
+    def _handle_map_click(self, event):
+        nearest_hit = None
+        nearest_distance = None
+        for hit in self.map_node_hits:
+            dx = event.x - hit["x"]
+            dy = event.y - hit["y"]
+            distance_sq = (dx * dx) + (dy * dy)
+            hit_radius_sq = hit["hit_radius"] * hit["hit_radius"]
+            if distance_sq > hit_radius_sq:
+                continue
+            if nearest_distance is None or distance_sq < nearest_distance:
+                nearest_hit = hit
+                nearest_distance = distance_sq
+
+        if nearest_hit is None:
+            return
+
+        node_hex = nearest_hit.get("node_id_hex")
+        self.pending_selected_node_hex = node_hex
+        if not self._select_node_by_hex(node_hex):
+            if self.node_filter_entry.get().strip():
+                self.node_filter_entry.delete(0, tk.END)
+        self._set_feedback(f"Map selected {node_hex}", "active")
+        self.refresh()
+
     def _extract_lat_lon(self, entry):
         lat = safe_get(entry, 'latitude', safe_get(entry, 'lat'))
         lon = safe_get(entry, 'longitude', safe_get(entry, 'lon'))
@@ -2378,6 +2420,7 @@ class AALNPDesktopGUI:
     def _render_activity_map(self, snapshot, selected_node_hex=None):
         width = max(self.map_canvas.winfo_width(), 360)
         height = max(self.map_canvas.winfo_height(), 250)
+        self.map_node_hits = []
 
         current_pos = self._extract_lat_lon(snapshot.get("position", {}) or {})
         waypoint = self._extract_lat_lon(snapshot.get("waypoint", {}) or {})
@@ -2487,6 +2530,12 @@ class AALNPDesktopGUI:
             outline = self.colors["accent"] if is_selected else self.colors["border"]
             self.map_canvas.create_oval(x - radius, y - radius, x + radius, y + radius, fill=fill, outline=outline, width=2 if is_selected else 1)
             self.map_canvas.create_text(x + 8, y - 8, text=item["node_id_hex"][-4:], anchor="sw", fill=self.colors["silver"], font=self.fm(8, "bold"))
+            self.map_node_hits.append({
+                "node_id_hex": item["node_id_hex"],
+                "x": x,
+                "y": y,
+                "hit_radius": 12,
+            })
 
         if waypoint:
             x, y = project(waypoint)
@@ -2607,6 +2656,8 @@ class AALNPDesktopGUI:
         current_selection = self.nodes_list.curselection()
         if current_selection and current_selection[0] < len(self.filtered_nodes):
             selected_node_hex = self.filtered_nodes[current_selection[0]].get("node_id_hex")
+        if self.pending_selected_node_hex:
+            selected_node_hex = self.pending_selected_node_hex
 
         filter_term = self.node_filter_entry.get().strip().lower()
         filtered_nodes = []
@@ -2665,6 +2716,7 @@ class AALNPDesktopGUI:
             selected_node_hex = selected_entry.get("node_id_hex")
         else:
             selected_node_hex = None
+        self.pending_selected_node_hex = None
 
         self._render_activity_map(snapshot, selected_node_hex)
 

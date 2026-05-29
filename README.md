@@ -5,7 +5,7 @@
 
 AALNP is a significantly enhanced Meshtastic plugin developed by Akita Engineering, focused on providing advanced, practical location sharing, tracking, and simple navigation features over LoRa. Version 2.1 adds interactive commands, display output, geo-fencing, and local track storage.
 
-Version 2.1 also supports an optional local desktop console for live monitoring and configuration. The GUI uses a black, grey, silver, titanium, white, and green palette and can show local status, an activity map, nearby nodes, selected-node telemetry, navigation info, geofence state, display preview text, recent GeoJSON activity, and direct location-request controls.
+Version 2.1 also supports an optional local desktop console for live monitoring and configuration. The GUI uses a black, grey, silver, titanium, white, and green palette and can show local status, an activity map, nearby nodes, selected-node telemetry, navigation info, geofence state, display preview text, recent GeoJSON activity, and direct location-request controls. The activity map is interactive, so clicking a plotted nearby node focuses that node in the detail panel.
 
 ## Overview
 
@@ -129,6 +129,7 @@ If you start with `--gui`, the desktop console exposes:
 - Live node and queue status
 - Current GPS fix, speed, and last broadcast age
 - Activity map showing your position, recent GeoJSON trail, waypoint, and nearby nodes
+- Click-to-select nearby nodes directly from the activity map
 - Waypoint distance and bearing
 - Nearby node summaries with live filtering
 - Selected-node telemetry with radio metrics and recent track points
