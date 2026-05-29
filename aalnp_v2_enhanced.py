@@ -267,6 +267,10 @@ class AALNPv2_Enhanced:
         self.config_lock = threading.Lock()
         # Store last display content for inspection/debugging
         self._last_display = []
+        self._geojson_cache_path = None
+        self._geojson_cache_mtime = None
+        self._geojson_recent_cache = []
+        self._geojson_feature_count = 0
 
         # Initialize features based on loaded config
         self._init_geofences()
@@ -1378,6 +1382,9 @@ class AALNPv2_Enhanced:
             entry['node_id_hex'] = format_node_id(node_id)
             rx_ts = safe_get(entry, 'rx_ts')
             entry['age_s'] = max(0.0, now - float(rx_ts)) if rx_ts else None
+            node_track = self.node_tracks.get(node_id)
+            entry['track_count'] = len(node_track) if node_track else 0
+            entry['track_preview'] = list(node_track)[-4:] if node_track else []
 
             node_lat = safe_get(entry, 'lat', safe_get(entry, 'latitude'))
             node_lon = safe_get(entry, 'lon', safe_get(entry, 'longitude'))
@@ -1396,6 +1403,8 @@ class AALNPv2_Enhanced:
             queue_depth = self.msg_queue.qsize()
         except Exception:
             queue_depth = 0
+
+        recent_geojson = self.get_recent_geojson_entries(limit=12)
 
         return {
             "running": self.running,
@@ -1416,6 +1425,8 @@ class AALNPv2_Enhanced:
             "display_lines": list(self._last_display),
             "geofence_states": dict(self.geofence_states),
             "last_broadcast_age_s": (now - self.last_broadcast_time) if self.last_broadcast_time else None,
+            "recent_geojson": recent_geojson,
+            "geojson_entry_count": self._geojson_feature_count,
             "log_file": config_copy.get('log_file'),
             "config_path": self.config_path,
         }
@@ -1431,6 +1442,73 @@ class AALNPv2_Enhanced:
     def set_metadata(self, metadata):
         """Public helper used by the desktop GUI to update node metadata."""
         return self._cmd_set_meta([metadata])
+
+    def request_location(self, node_id):
+        """Public helper used by the desktop GUI to queue a location request."""
+        if isinstance(node_id, int):
+            return self._cmd_req_loc([f"{int(node_id):08x}"])
+        return self._cmd_req_loc([str(node_id).strip()])
+
+    def get_recent_geojson_entries(self, limit=12):
+        """Return cached recent GeoJSON log entries for the desktop GUI."""
+        log_file = self.config.get("log_file")
+        if not log_file or not os.path.exists(log_file) or os.path.getsize(log_file) <= 0:
+            self._geojson_cache_path = log_file
+            self._geojson_cache_mtime = None
+            self._geojson_recent_cache = []
+            self._geojson_feature_count = 0
+            return []
+
+        try:
+            current_mtime = os.path.getmtime(log_file)
+        except OSError:
+            return []
+
+        if self._geojson_cache_path != log_file or self._geojson_cache_mtime != current_mtime:
+            parsed_entries = []
+            try:
+                with open(log_file, 'r') as f:
+                    feature_collection = json.load(f)
+
+                features = feature_collection.get("features", []) if isinstance(feature_collection, dict) else []
+                for feature in features:
+                    if not isinstance(feature, dict):
+                        continue
+                    properties = feature.get("properties", {}) if isinstance(feature.get("properties"), dict) else {}
+                    geometry = feature.get("geometry", {}) if isinstance(feature.get("geometry"), dict) else {}
+                    coordinates = geometry.get("coordinates", []) if isinstance(geometry.get("coordinates"), (list, tuple)) else []
+
+                    longitude = properties.get("longitude")
+                    latitude = properties.get("latitude")
+                    if latitude is None and len(coordinates) > 1:
+                        latitude = coordinates[1]
+                    if longitude is None and len(coordinates) > 0:
+                        longitude = coordinates[0]
+
+                    parsed_entries.append({
+                        "node_id_hex": format_node_id(properties.get("node_id")),
+                        "log_type": properties.get("log_type", "UNKNOWN"),
+                        "reason": properties.get("reason"),
+                        "metadata": properties.get("metadata"),
+                        "latitude": latitude,
+                        "longitude": longitude,
+                        "gps_timestamp": properties.get("gps_timestamp"),
+                        "log_timestamp": properties.get("log_timestamp"),
+                    })
+            except Exception:
+                logger.debug("Could not parse GeoJSON log for GUI snapshot.", exc_info=True)
+                parsed_entries = []
+
+            self._geojson_cache_path = log_file
+            self._geojson_cache_mtime = current_mtime
+            self._geojson_recent_cache = parsed_entries
+            self._geojson_feature_count = len(parsed_entries)
+
+        try:
+            safe_limit = max(1, int(limit))
+        except (TypeError, ValueError):
+            safe_limit = 12
+        return list(reversed(self._geojson_recent_cache[-safe_limit:]))
 
 
     # --- Text Command Handling ---
@@ -1610,6 +1688,9 @@ class AALNPv2_Enhanced:
         # Validate argument count
         if len(args) < 1:
             return f"Usage: {self.command_prefix} reqloc <node_id_hex>"
+
+        if self.node_num is None:
+            return "Error: Local node ID unavailable. Wait for Meshtastic connection."
 
         target_id_str = args[0].replace("!", "").replace("0x","") # Clean up input hex string
 
@@ -1841,8 +1922,12 @@ class AALNPDesktopGUI:
         self.status_widgets = {}
         self.metric_widgets = {}
         self.last_logs_text = None
+        self.last_map_signature = None
         self.last_nodes_text = None
-        self.last_display_text = None
+        self.last_geojson_text = None
+        self.last_detail_text = None
+        self.filtered_nodes = []
+        self._refresh_job = None
         self._closed = False
 
         self._build_ui()
@@ -2012,6 +2097,26 @@ class AALNPDesktopGUI:
         for title, row, col in summary_titles:
             self.metric_widgets[title] = self._make_metric_tile(summary_body, title, row, col)
 
+        map_card, map_body = self._make_card(left_col, "Activity Map", "Current position, recent GeoJSON trail, waypoint, and nearby nodes in one local view.")
+        map_card.pack(fill=tk.X, pady=(0, 14))
+        self.map_canvas = tk.Canvas(
+            map_body,
+            height=250,
+            bg=self.colors["surface"],
+            relief=tk.FLAT,
+            highlightthickness=1,
+            highlightbackground=self.colors["border"],
+            highlightcolor=self.colors["accent"],
+        )
+        self.map_canvas.pack(fill=tk.X)
+        tk.Label(
+            map_body,
+            text="YOU  recent trail  waypoint  nearby nodes",
+            font=self.f(8, "bold"),
+            fg=self.colors["silver"],
+            bg=self.colors["panel"],
+        ).pack(anchor="w", pady=(8, 0))
+
         controls_card, controls_body = self._make_card(left_col, "Config Controls", "Update metadata and waypoint settings stored in aalnp_config.json.")
         controls_card.pack(fill=tk.BOTH, expand=True)
         controls_body.grid_columnconfigure(1, weight=1)
@@ -2051,12 +2156,16 @@ class AALNPDesktopGUI:
         self.display_preview = tk.Label(display_body, text="No display output yet.", justify=tk.LEFT, anchor="w", font=self.fm(11, "normal"), fg=self.colors["white"], bg=self.colors["surface"], padx=12, pady=12)
         self.display_preview.grid(row=2, column=0, columnspan=2, sticky="ew")
 
-        nodes_card, nodes_body = self._make_card(right_col, "Nearby Nodes", "Recently heard nodes sorted by most recent reception.")
-        nodes_card.pack(fill=tk.BOTH, expand=True)
-        self.nodes_text = ScrolledText(
-            nodes_body,
-            wrap=tk.NONE,
-            height=16,
+        geojson_card, geojson_body = self._make_card(right_col, "GeoJSON Activity", "Recent entries from the on-disk AALNP log.")
+        geojson_card.pack(fill=tk.X, pady=(0, 14))
+        for col in range(2):
+            geojson_body.grid_columnconfigure(col, weight=1)
+        self.metric_widgets["GeoJSON Entries"] = self._make_metric_tile(geojson_body, "GeoJSON Entries", 0, 0)
+        self.metric_widgets["GeoJSON Log"] = self._make_metric_tile(geojson_body, "Log File", 0, 1)
+        self.geojson_text = ScrolledText(
+            geojson_body,
+            wrap=tk.WORD,
+            height=7,
             bg=self.colors["surface"],
             fg=self.colors["white"],
             insertbackground=self.colors["white"],
@@ -2066,8 +2175,74 @@ class AALNPDesktopGUI:
             highlightcolor=self.colors["accent"],
             font=self.fm(10, "normal"),
         )
-        self.nodes_text.pack(fill=tk.BOTH, expand=True)
-        self.nodes_text.config(state=tk.DISABLED)
+        self.geojson_text.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self.geojson_text.config(state=tk.DISABLED)
+
+        detail_card, detail_body = self._make_card(right_col, "Selected Node", "Focused telemetry, radio metrics, and recent track points for the current nearby-node selection.")
+        detail_card.pack(fill=tk.X, pady=(0, 14))
+        for col in range(2):
+            detail_body.grid_columnconfigure(col, weight=1)
+        self.metric_widgets["Selected Node"] = self._make_metric_tile(detail_body, "Selected Node", 0, 0)
+        self.metric_widgets["Track Points"] = self._make_metric_tile(detail_body, "Track Points", 0, 1)
+        self.node_detail_text = ScrolledText(
+            detail_body,
+            wrap=tk.WORD,
+            height=8,
+            bg=self.colors["surface"],
+            fg=self.colors["white"],
+            insertbackground=self.colors["white"],
+            relief=tk.FLAT,
+            highlightthickness=1,
+            highlightbackground=self.colors["border"],
+            highlightcolor=self.colors["accent"],
+            font=self.fm(10, "normal"),
+        )
+        self.node_detail_text.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self.node_detail_text.config(state=tk.DISABLED)
+
+        nodes_card, nodes_body = self._make_card(right_col, "Nearby Nodes", "Filter nearby nodes and send direct reqloc requests.")
+        nodes_card.pack(fill=tk.BOTH, expand=True)
+        filter_row = tk.Frame(nodes_body, bg=self.colors["panel"])
+        filter_row.pack(fill=tk.X, pady=(0, 10))
+        tk.Label(filter_row, text="FILTER", font=self.f(8, "bold"), fg=self.colors["silver"], bg=self.colors["panel"]).pack(side=tk.LEFT, padx=(0, 6))
+        self.node_filter_entry = tk.Entry(filter_row, width=16)
+        self._style_entry(self.node_filter_entry)
+        self.node_filter_entry.pack(side=tk.LEFT, padx=(0, 12))
+        self.node_filter_entry.bind("<KeyRelease>", lambda _event: self.refresh())
+
+        tk.Label(filter_row, text="TARGET", font=self.f(8, "bold"), fg=self.colors["silver"], bg=self.colors["panel"]).pack(side=tk.LEFT, padx=(0, 6))
+        self.request_node_entry = tk.Entry(filter_row, width=18)
+        self._style_entry(self.request_node_entry)
+        self.request_node_entry.pack(side=tk.LEFT, padx=(0, 12))
+        self.request_node_entry.bind("<Return>", lambda _event: self._request_manual_node())
+
+        self.request_selected_button = self._make_button(filter_row, "REQUEST SELECTED", self._request_selected_node, tone="primary")
+        self.request_selected_button.pack(side=tk.LEFT, padx=(0, 8))
+        self._make_button(filter_row, "REQUEST ID", self._request_manual_node, tone="secondary").pack(side=tk.LEFT)
+
+        tk.Label(nodes_body, text="NODE ID        AGE    DIST    META", font=self.fm(10, "bold"), fg=self.colors["silver"], bg=self.colors["panel"]).pack(anchor="w", pady=(0, 6))
+        list_frame = tk.Frame(nodes_body, bg=self.colors["panel"])
+        list_frame.pack(fill=tk.BOTH, expand=True)
+        self.nodes_list = tk.Listbox(
+            list_frame,
+            bg=self.colors["surface"],
+            fg=self.colors["white"],
+            selectbackground=self.colors["accent_2"],
+            selectforeground=self.colors["white"],
+            relief=tk.FLAT,
+            highlightthickness=1,
+            highlightbackground=self.colors["border"],
+            highlightcolor=self.colors["accent"],
+            font=self.fm(10, "normal"),
+            activestyle="none",
+            exportselection=False,
+        )
+        nodes_scrollbar = tk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.nodes_list.yview)
+        self.nodes_list.config(yscrollcommand=nodes_scrollbar.set)
+        self.nodes_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        nodes_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.nodes_list.bind("<<ListboxSelect>>", self._update_request_target_from_selection)
+        self.nodes_list.bind("<Double-Button-1>", lambda _event: self._request_selected_node())
 
         log_card, log_body = self._make_card(shell, "Recent Activity", "Live AALNP and Meshtastic log stream for local inspection.")
         log_card.pack(fill=tk.BOTH, expand=True, pady=(14, 0))
@@ -2116,6 +2291,223 @@ class AALNPDesktopGUI:
         self._set_feedback(response, tone)
         self.refresh(force_sync_inputs=True)
 
+    def _request_manual_node(self):
+        target = self.request_node_entry.get().strip()
+        if not target:
+            self._set_feedback("Target node ID is required.", "bright")
+            return
+        response = self.plugin.request_location(target)
+        tone = "active" if response.startswith("Location request sent") else "bright"
+        self._set_feedback(response, tone)
+
+    def _request_selected_node(self):
+        selection = self.nodes_list.curselection()
+        if not selection or selection[0] >= len(self.filtered_nodes):
+            self._set_feedback("Select a nearby node first.", "bright")
+            return
+        node_hex = self.filtered_nodes[selection[0]].get("node_id_hex", "")
+        self.request_node_entry.delete(0, tk.END)
+        self.request_node_entry.insert(0, node_hex)
+        self._request_manual_node()
+
+    def _update_request_target_from_selection(self, _event=None):
+        selection = self.nodes_list.curselection()
+        if not selection or selection[0] >= len(self.filtered_nodes):
+            return
+        node_hex = self.filtered_nodes[selection[0]].get("node_id_hex", "")
+        if not node_hex:
+            return
+        self.request_node_entry.delete(0, tk.END)
+        self.request_node_entry.insert(0, node_hex)
+
+    def _extract_lat_lon(self, entry):
+        lat = safe_get(entry, 'latitude', safe_get(entry, 'lat'))
+        lon = safe_get(entry, 'longitude', safe_get(entry, 'lon'))
+        if lat is None or lon is None:
+            return None
+        try:
+            return float(lat), float(lon)
+        except (TypeError, ValueError):
+            return None
+
+    def _format_numeric(self, value, fmt_spec=".1f", suffix=""):
+        try:
+            return f"{float(value):{fmt_spec}}{suffix}"
+        except (TypeError, ValueError):
+            return "--"
+
+    def _format_timestamp(self, value):
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(value).astimezone().strftime("%H:%M:%S")
+        return "--:--:--"
+
+    def _format_node_detail_text(self, entry):
+        if not entry:
+            return "Select a nearby node to inspect its telemetry, radio metrics, and recent track points."
+
+        coords = self._extract_lat_lon(entry)
+        coord_text = "--" if not coords else f"{coords[0]:.5f}, {coords[1]:.5f}"
+        age = entry.get("age_s")
+        dist = entry.get("distance_m")
+
+        lines = [
+            f"Meta      {safe_get(entry, 'meta', '-') or '-'}",
+            f"Age       {'--' if age is None else f'{age:.0f}s'}",
+            f"Distance  {'--' if dist is None else f'{dist:.0f}m'}",
+            f"Coords    {coord_text}",
+            f"Altitude  {self._format_numeric(safe_get(entry, 'alt', safe_get(entry, 'altitude')), '.1f', 'm')}",
+            f"Speed     {self._format_numeric(safe_get(entry, 'spd'), '.1f', 'm/s')}",
+            f"Heading   {self._format_numeric(safe_get(entry, 'hdg'), '.0f', 'd')}",
+            f"Accuracy  {self._format_numeric(safe_get(entry, 'acc'), '.0f', 'm')}",
+            f"Radio     RSSI {safe_get(entry, 'rssi', '--')} | SNR {safe_get(entry, 'snr', '--')}",
+        ]
+
+        track_preview = entry.get("track_preview", [])
+        if track_preview:
+            lines.append("")
+            lines.append("Recent Track")
+            for point in reversed(track_preview):
+                point_coords = self._extract_lat_lon(point)
+                point_text = "--" if not point_coords else f"{point_coords[0]:.5f}, {point_coords[1]:.5f}"
+                lines.append(
+                    f"{self._format_timestamp(point.get('ts'))}  {point_text}  {self._format_numeric(point.get('spd'), '.1f', 'm/s')}"
+                )
+
+        return "\n".join(lines)
+
+    def _render_activity_map(self, snapshot, selected_node_hex=None):
+        width = max(self.map_canvas.winfo_width(), 360)
+        height = max(self.map_canvas.winfo_height(), 250)
+
+        current_pos = self._extract_lat_lon(snapshot.get("position", {}) or {})
+        waypoint = self._extract_lat_lon(snapshot.get("waypoint", {}) or {})
+
+        geojson_entries = []
+        for entry in reversed(snapshot.get("recent_geojson", [])):
+            coords = self._extract_lat_lon(entry)
+            if coords:
+                geojson_entries.append({
+                    "coords": coords,
+                    "node_id_hex": entry.get("node_id_hex", "Unknown"),
+                    "label": entry.get("metadata") or entry.get("reason") or entry.get("log_type", "LOG"),
+                })
+
+        nearby_nodes = []
+        for entry in snapshot.get("other_nodes", [])[:12]:
+            coords = self._extract_lat_lon(entry)
+            if coords:
+                nearby_nodes.append({
+                    "coords": coords,
+                    "node_id_hex": entry.get("node_id_hex", "Unknown"),
+                })
+
+        signature = (
+            current_pos,
+            waypoint,
+            tuple(item["coords"] for item in geojson_entries),
+            tuple(item["coords"] for item in nearby_nodes),
+            selected_node_hex,
+            width,
+            height,
+        )
+        if signature == self.last_map_signature:
+            return
+        self.last_map_signature = signature
+
+        self.map_canvas.delete("all")
+        self.map_canvas.create_rectangle(0, 0, width, height, fill=self.colors["surface"], outline="")
+
+        if not any([current_pos, waypoint, geojson_entries, nearby_nodes]):
+            self.map_canvas.create_text(
+                width / 2,
+                height / 2,
+                text="No plotted positions yet.",
+                fill=self.colors["silver"],
+                font=self.f(11, "bold"),
+            )
+            return
+
+        bounds_points = []
+        if current_pos:
+            bounds_points.append(current_pos)
+        if waypoint:
+            bounds_points.append(waypoint)
+        bounds_points.extend(item["coords"] for item in geojson_entries)
+        bounds_points.extend(item["coords"] for item in nearby_nodes)
+
+        latitudes = [coords[0] for coords in bounds_points]
+        longitudes = [coords[1] for coords in bounds_points]
+        min_lat = min(latitudes)
+        max_lat = max(latitudes)
+        min_lon = min(longitudes)
+        max_lon = max(longitudes)
+
+        lat_span = max(max_lat - min_lat, 0.0008)
+        lon_span = max(max_lon - min_lon, 0.0008)
+        min_lat -= lat_span * 0.18
+        max_lat += lat_span * 0.18
+        min_lon -= lon_span * 0.18
+        max_lon += lon_span * 0.18
+
+        margin = 22
+        plot_width = max(1, width - (margin * 2))
+        plot_height = max(1, height - (margin * 2))
+
+        def project(coords):
+            lat, lon = coords
+            x = margin + ((lon - min_lon) / (max_lon - min_lon)) * plot_width
+            y = height - margin - ((lat - min_lat) / (max_lat - min_lat)) * plot_height
+            return x, y
+
+        for step in range(5):
+            x = margin + (plot_width * step / 4)
+            y = margin + (plot_height * step / 4)
+            self.map_canvas.create_line(x, margin, x, height - margin, fill=self.colors["surface_2"], dash=(2, 4))
+            self.map_canvas.create_line(margin, y, width - margin, y, fill=self.colors["surface_2"], dash=(2, 4))
+
+        self.map_canvas.create_rectangle(margin, margin, width - margin, height - margin, outline=self.colors["border"], width=1)
+
+        trail_points = []
+        for item in geojson_entries:
+            x, y = project(item["coords"])
+            trail_points.extend([x, y])
+        if len(trail_points) >= 4:
+            self.map_canvas.create_line(*trail_points, fill=self.colors["accent_2"], width=2, smooth=True)
+
+        for index, item in enumerate(geojson_entries):
+            x, y = project(item["coords"])
+            radius = 3 if index < len(geojson_entries) - 1 else 4
+            self.map_canvas.create_oval(x - radius, y - radius, x + radius, y + radius, fill=self.colors["titanium"], outline="")
+
+        for item in nearby_nodes:
+            x, y = project(item["coords"])
+            is_selected = item["node_id_hex"] == selected_node_hex
+            radius = 5 if is_selected else 4
+            fill = self.colors["white"] if is_selected else self.colors["silver"]
+            outline = self.colors["accent"] if is_selected else self.colors["border"]
+            self.map_canvas.create_oval(x - radius, y - radius, x + radius, y + radius, fill=fill, outline=outline, width=2 if is_selected else 1)
+            self.map_canvas.create_text(x + 8, y - 8, text=item["node_id_hex"][-4:], anchor="sw", fill=self.colors["silver"], font=self.fm(8, "bold"))
+
+        if waypoint:
+            x, y = project(waypoint)
+            self.map_canvas.create_line(x - 8, y, x + 8, y, fill=self.colors["white"], width=2)
+            self.map_canvas.create_line(x, y - 8, x, y + 8, fill=self.colors["white"], width=2)
+            self.map_canvas.create_text(x + 10, y + 10, text=safe_get(snapshot.get("waypoint", {}), 'name', 'WP'), anchor="nw", fill=self.colors["white"], font=self.f(9, "bold"))
+
+        if current_pos:
+            x, y = project(current_pos)
+            self.map_canvas.create_oval(x - 7, y - 7, x + 7, y + 7, fill=self.colors["accent"], outline=self.colors["white"], width=2)
+            self.map_canvas.create_text(x + 10, y - 12, text="YOU", anchor="sw", fill=self.colors["accent"], font=self.f(10, "bold"))
+
+        self.map_canvas.create_text(
+            margin,
+            height - 6,
+            anchor="sw",
+            text=f"Lat {min_lat:.4f} to {max_lat:.4f} | Lon {min_lon:.4f} to {max_lon:.4f}",
+            fill=self.colors["muted"],
+            font=self.f(8, "bold"),
+        )
+
     def _sync_inputs_from_snapshot(self, snapshot):
         metadata = snapshot.get("metadata", "")
         if self.metadata_entry.get().strip() != metadata and self.root.focus_get() is not self.metadata_entry:
@@ -2136,6 +2528,13 @@ class AALNPDesktopGUI:
             self.wp_lon_entry.insert(0, "" if lon == '' else str(lon))
 
     def refresh(self, force_sync_inputs=False):
+        if self._refresh_job is not None:
+            try:
+                self.root.after_cancel(self._refresh_job)
+            except Exception:
+                pass
+            self._refresh_job = None
+
         snapshot = self.plugin.get_runtime_snapshot()
         connected = snapshot.get("connected", False)
         running = snapshot.get("running", False)
@@ -2172,12 +2571,56 @@ class AALNPDesktopGUI:
         else:
             self.metric_widgets["Geofences"].config(text="No geofences configured", fg=self.colors["silver"])
 
+        self.metric_widgets["GeoJSON Entries"].config(text=str(snapshot.get("geojson_entry_count", 0)))
+        log_file = snapshot.get("log_file")
+        if log_file:
+            self.metric_widgets["GeoJSON Log"].config(text=os.path.basename(log_file), fg=self.colors["white"])
+        else:
+            self.metric_widgets["GeoJSON Log"].config(text="Disabled", fg=self.colors["silver"])
+
         display_lines = snapshot.get("display_lines", []) or ["No display output yet."]
         display_text = "\n".join(display_lines)
         self.display_preview.config(text=display_text, fg=self.colors["accent"] if snapshot.get("position_fix") else self.colors["silver"])
 
-        node_lines = ["NODE ID        AGE    DIST    META"]
-        for entry in snapshot.get("other_nodes", [])[:12]:
+        geojson_lines = []
+        for entry in snapshot.get("recent_geojson", []):
+            timestamp = entry.get("log_timestamp")
+            if isinstance(timestamp, (int, float)):
+                time_str = datetime.fromtimestamp(timestamp).astimezone().strftime("%H:%M:%S")
+            else:
+                time_str = "--:--:--"
+            latitude = entry.get("latitude")
+            longitude = entry.get("longitude")
+            coords = "--"
+            if isinstance(latitude, (int, float)) and isinstance(longitude, (int, float)):
+                coords = f"{latitude:.4f},{longitude:.4f}"
+            descriptor = (entry.get("metadata") or entry.get("reason") or "-")[:26]
+            geojson_lines.append(
+                f"{time_str}  {entry.get('log_type', 'UNK'):<8}  {entry.get('node_id_hex', 'Unknown'):<13}  {coords:<20}  {descriptor}"
+            )
+        geojson_text = "\n".join(geojson_lines) if geojson_lines else "No GeoJSON entries logged yet."
+        if geojson_text != self.last_geojson_text:
+            self._set_text_widget(self.geojson_text, geojson_text)
+            self.last_geojson_text = geojson_text
+
+        selected_node_hex = None
+        current_selection = self.nodes_list.curselection()
+        if current_selection and current_selection[0] < len(self.filtered_nodes):
+            selected_node_hex = self.filtered_nodes[current_selection[0]].get("node_id_hex")
+
+        filter_term = self.node_filter_entry.get().strip().lower()
+        filtered_nodes = []
+        for entry in snapshot.get("other_nodes", []):
+            age = entry.get("age_s")
+            dist = entry.get("distance_m")
+            meta = (safe_get(entry, 'meta', '') or '').strip()[:22]
+            haystack = f"{entry.get('node_id_hex', '')} {meta}".lower()
+            if filter_term and filter_term not in haystack:
+                continue
+            filtered_nodes.append(entry)
+
+        node_lines = []
+        for entry in filtered_nodes[:50]:
             age = entry.get("age_s")
             dist = entry.get("distance_m")
             meta = (safe_get(entry, 'meta', '') or '').strip()[:22]
@@ -2187,10 +2630,56 @@ class AALNPDesktopGUI:
                 f" {('--' if dist is None else f'{dist:.0f}m'):>7}"
                 f"  {meta or '-'}"
             )
+
+        self.filtered_nodes = filtered_nodes[:50]
         nodes_text = "\n".join(node_lines)
         if nodes_text != self.last_nodes_text:
-            self._set_text_widget(self.nodes_text, nodes_text)
+            self.nodes_list.delete(0, tk.END)
+            if node_lines:
+                for line in node_lines:
+                    self.nodes_list.insert(tk.END, line)
+            else:
+                self.nodes_list.insert(tk.END, "No nodes match the current filter.")
             self.last_nodes_text = nodes_text
+
+        if self.filtered_nodes:
+            self.request_selected_button.config(state=tk.NORMAL)
+            if selected_node_hex:
+                for index, entry in enumerate(self.filtered_nodes):
+                    if entry.get("node_id_hex") == selected_node_hex:
+                        self.nodes_list.selection_clear(0, tk.END)
+                        self.nodes_list.selection_set(index)
+                        self.nodes_list.see(index)
+                        break
+            elif not self.nodes_list.curselection():
+                self.nodes_list.selection_set(0)
+                self.nodes_list.see(0)
+        else:
+            self.request_selected_button.config(state=tk.DISABLED)
+            self.nodes_list.selection_clear(0, tk.END)
+
+        selected_entry = None
+        current_selection = self.nodes_list.curselection()
+        if current_selection and current_selection[0] < len(self.filtered_nodes):
+            selected_entry = self.filtered_nodes[current_selection[0]]
+            selected_node_hex = selected_entry.get("node_id_hex")
+        else:
+            selected_node_hex = None
+
+        self._render_activity_map(snapshot, selected_node_hex)
+
+        if selected_entry:
+            self.metric_widgets["Selected Node"].config(text=selected_entry.get("node_id_hex", "Unknown"), fg=self.colors["white"])
+            self.metric_widgets["Track Points"].config(text=str(selected_entry.get("track_count", 0)), fg=self.colors["white"])
+            detail_text = self._format_node_detail_text(selected_entry)
+        else:
+            self.metric_widgets["Selected Node"].config(text="None", fg=self.colors["silver"])
+            self.metric_widgets["Track Points"].config(text="0", fg=self.colors["silver"])
+            detail_text = self._format_node_detail_text(None)
+
+        if detail_text != self.last_detail_text:
+            self._set_text_widget(self.node_detail_text, detail_text)
+            self.last_detail_text = detail_text
 
         log_text = "\n".join(self.log_handler.get_lines()[-180:])
         if log_text != self.last_logs_text:
@@ -2202,10 +2691,16 @@ class AALNPDesktopGUI:
             self._sync_inputs_from_snapshot(snapshot)
 
         if not self._closed:
-            self.root.after(1000, self.refresh)
+            self._refresh_job = self.root.after(1000, self.refresh)
 
     def _on_close(self):
         self._closed = True
+        if self._refresh_job is not None:
+            try:
+                self.root.after_cancel(self._refresh_job)
+            except Exception:
+                pass
+            self._refresh_job = None
         self.root.quit()
         self.root.destroy()
 
